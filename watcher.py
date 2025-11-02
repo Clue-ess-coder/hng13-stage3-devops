@@ -1,156 +1,282 @@
 #!/usr/bin/env python3
+
 import os
 import re
 import time
 import requests
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timedelta
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
 
-# Configuration from environment variables
-SLACK_WEBHOOK_URL = os.getenv('SLACK_WEBHOOK_URL')
-ERROR_RATE_THRESHOLD = float(os.getenv('ERROR_RATE_THRESHOLD', '2.0'))
-WINDOW_SIZE = int(os.getenv('WINDOW_SIZE', '200'))
-ALERT_COOLDOWN_SEC = int(os.getenv('ALERT_COOLDOWN_SEC', '300'))
-LOG_FILE = os.getenv('LOG_FILE', '/var/log/nginx/access.log')
+LOG_FILE = os.getenv("LOG_FILE", "/var/log/nginx/custom_access.log")
+WINDOW_SIZE = int(os.getenv("WINDOW_SIZE", "200"))
+ERROR_THRESHOLD = float(os.getenv("ERROR_RATE_THRESHOLD", "2.0")) / 100.0
+ALERT_COOLDOWN = int(os.getenv("ALERT_COOLDOWN_SEC", "300"))
+SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
 
 # State tracking
-last_pool = None
 request_window = deque(maxlen=WINDOW_SIZE)
+current_pool = None
 last_failover_alert = 0
 last_error_alert = 0
+file_position = 0
+last_parsed_data = {}
+is_startup = True  # Flag to prevent alerts during initial log processing
 
-def send_slack_alert(message, alert_type):
-    """Send alert to Slack with color coding"""
+
+def get_current_time():
+    """Get current time in UTC+1 timezone"""
+    return (datetime.utcnow() + timedelta(hours=1)).strftime('%Y-%m-%d %H:%M:%S')
+
+
+def parse_log_line(line):
+    """Extract all relevant fields from log line"""
+    try:
+        pool_match = re.search(r'pool=(\w+)', line)
+        release_match = re.search(r'release=([\w\.\-]+)', line)
+        status_match = re.search(r'upstream_status=(\d+)', line)
+        upstream_match = re.search(r'upstream=([\d\.:]+)', line)
+        request_time_match = re.search(r'request_time=([\d\.]+)', line)
+        upstream_time_match = re.search(r'upstream_response_time=([\d\.]+)', line)
+        
+        if pool_match and status_match:
+            return {
+                'pool': pool_match.group(1),
+                'release': release_match.group(1) if release_match else 'unknown',
+                'upstream_status': int(status_match.group(1)),
+                'upstream': upstream_match.group(1) if upstream_match else 'unknown',
+                'request_time': request_time_match.group(1) if request_time_match else '0',
+                'upstream_response_time': upstream_time_match.group(1) if upstream_time_match else '0'
+            }
+    except Exception as e:
+        print(f"[DEBUG] Parse error: {e}")
+    
+    return None
+
+
+def send_slack_alert(message, parsed_data=None):
+    timestamp = get_current_time()
+    
+    # Build detailed message
+    alert_text = f"{message}\nTime: {timestamp}"
+    
+    if parsed_data:
+        alert_text += f"\n\nDetails:"
+        alert_text += f"\n- Pool: {parsed_data.get('pool', 'unknown')}"
+        alert_text += f"\n- Release: {parsed_data.get('release', 'unknown')}"
+        alert_text += f"\n- Upstream: {parsed_data.get('upstream', 'unknown')}"
+        alert_text += f"\n- Upstream Status: {parsed_data.get('upstream_status', 'unknown')}"
+        alert_text += f"\n- Request Time: {parsed_data.get('request_time', '0')}s"
+        alert_text += f"\n- Upstream Response Time: {parsed_data.get('upstream_response_time', '0')}s"
+    
+    print(f"[ALERT] {message}")
+    if parsed_data:
+        print(f"        Time: {timestamp}")
+        print(f"        Pool: {parsed_data.get('pool')}, Release: {parsed_data.get('release')}")
+        print(f"        Upstream: {parsed_data.get('upstream')}, Status: {parsed_data.get('upstream_status')}")
+    
     if not SLACK_WEBHOOK_URL:
-        print(f"[WARNING] No SLACK_WEBHOOK_URL configured. Alert: {message}")
+        print("[WARN] SLACK_WEBHOOK_URL not set, skipping Slack notification")
         return
     
-    color = "#ff0000" if alert_type == "error" else "#ffa500" if alert_type == "failover" else "#00ff00"
-    
-    payload = {
-        "attachments": [{
-            "color": color,
-            "title": f"🚨 Alert: {alert_type.upper()}",
-            "text": message,
-            "footer": "Blue/Green Deployment Monitor",
-            "ts": int(time.time())
-        }]
-    }
-    
     try:
-        response = requests.post(SLACK_WEBHOOK_URL, json=payload, timeout=5)
+        response = requests.post(
+            SLACK_WEBHOOK_URL,
+            json={"text": alert_text},
+            timeout=10
+        )
         if response.status_code == 200:
-            print(f"[SLACK] Alert sent: {alert_type}")
+            print("[INFO] Slack alert sent successfully")
         else:
-            print(f"[ERROR] Slack webhook failed: {response.status_code}")
+            print(f"[ERROR] Slack failed: {response.status_code}")
     except Exception as e:
         print(f"[ERROR] Failed to send Slack alert: {e}")
 
-def parse_log_line(line):
-    """Parse Nginx log line to extract pool, upstream_status, and other fields"""
-    # Extract pool
-    pool_match = re.search(r'pool=(\w+)', line)
-    pool = pool_match.group(1) if pool_match else None
-    
-    # Extract upstream_status
-    status_match = re.search(r'upstream_status=(\d+)', line)
-    upstream_status = int(status_match.group(1)) if status_match else None
-    
-    # Extract release
-    release_match = re.search(r'release=([\w\-]+)', line)
-    release = release_match.group(1) if release_match else None
-    
-    # Extract upstream address
-    upstream_match = re.search(r'upstream=([\d\.:]+)', line)
-    upstream = upstream_match.group(1) if upstream_match else None
-    
-    return {
-        'pool': pool,
-        'upstream_status': upstream_status,
-        'release': release,
-        'upstream': upstream,
-        'line': line
-    }
 
-def check_failover(current_pool):
-    """Detect and alert on pool failover"""
-    global last_pool, last_failover_alert
+def check_failover(parsed_data):
+    global current_pool, last_failover_alert, last_parsed_data, is_startup
     
-    if last_pool and last_pool != current_pool:
-        current_time = time.time()
-        if current_time - last_failover_alert > ALERT_COOLDOWN_SEC:
-            message = f"⚠️ **Failover Detected**: {last_pool.upper()} → {current_pool.upper()}\n"
-            message += f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-            message += f"Previous pool ({last_pool}) is likely unhealthy. Check container status."
-            
-            send_slack_alert(message, "failover")
-            last_failover_alert = current_time
-            print(f"[ALERT] Failover: {last_pool} → {current_pool}")
+    pool = parsed_data['pool']
+    current_time = time.time()
     
-    last_pool = current_pool
-
-def check_error_rate():
-    """Check if error rate exceeds threshold"""
-    global last_error_alert
-    
-    if len(request_window) < 50:  # Need minimum samples
+    if current_pool is None:
+        current_pool = pool
+        print(f"[INFO] Initial pool detected: {pool}")
+        print(f"[INFO] Release: {parsed_data['release']}, Upstream: {parsed_data['upstream']}")
+        last_parsed_data = parsed_data
         return
     
-    error_count = sum(1 for status in request_window if status and status >= 500)
-    error_rate = (error_count / len(request_window)) * 100
-    
-    if error_rate > ERROR_RATE_THRESHOLD:
-        current_time = time.time()
-        if current_time - last_error_alert > ALERT_COOLDOWN_SEC:
-            message = f"🔥 **High Error Rate Detected**: {error_rate:.2f}%\n"
-            message += f"Threshold: {ERROR_RATE_THRESHOLD}%\n"
-            message += f"Window: {len(request_window)} requests\n"
-            message += f"5xx errors: {error_count}\n"
-            message += f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-            message += "Action: Check upstream application logs and consider toggling pools."
-            
-            send_slack_alert(message, "error")
-            last_error_alert = current_time
-            print(f"[ALERT] High error rate: {error_rate:.2f}% ({error_count}/{len(request_window)})")
+    if pool != current_pool:
+        time_since_last = current_time - last_failover_alert
+        
+        # Skip alerting during startup (processing historical logs)
+        if is_startup:
+            print(f"[INFO] Historical failover detected: {current_pool} → {pool} (startup, no alert)")
+            current_pool = pool
+            last_parsed_data = parsed_data
+            return
+        
+        if time_since_last > ALERT_COOLDOWN:
+            message = f"FAILOVER DETECTED\nPool switched: {current_pool} → {pool}"
+            send_slack_alert(message, parsed_data)
+            last_failover_alert = current_time
+            print(f"[WARN] Failover: {current_pool} → {pool}")
+        else:
+            remaining = int(ALERT_COOLDOWN - time_since_last)
+            print(f"[INFO] Failover detected: {current_pool} → {pool} (COOLDOWN ACTIVE, {remaining}s remaining)")
+        
+        current_pool = pool
+        last_parsed_data = parsed_data
 
-def tail_log_file():
-    """Tail log file and process new lines"""
-    print(f"[STARTUP] Monitoring {LOG_FILE}")
-    print(f"[CONFIG] Error threshold: {ERROR_RATE_THRESHOLD}%, Window: {WINDOW_SIZE}, Cooldown: {ALERT_COOLDOWN_SEC}s")
+
+def check_error_rate():
+    """Calculate error rate and alert if threshold exceeded"""
+    global last_error_alert, last_parsed_data, is_startup
+    
+    if len(request_window) < min(50, WINDOW_SIZE):
+        return  # Need minimum sample size
+    
+    total = len(request_window)
+    errors = sum(request_window)
+    error_rate = errors / total
+    current_time = time.time()
+    time_since_last = current_time - last_error_alert
+    
+    # Always show current error rate
+    status_indicator = "✓" if error_rate <= ERROR_THRESHOLD else "✗"
+    print(f"[INFO] Error rate: {error_rate*100:.2f}% ({errors}/{total}) {status_indicator}")
+    
+    if error_rate > ERROR_THRESHOLD:
+        # Skip alerting during startup
+        if is_startup:
+            print(f"[INFO] Historical high error rate: {error_rate*100:.2f}% (startup, no alert)")
+            return
+        
+        if time_since_last > ALERT_COOLDOWN:
+            message = (
+                f"HIGH ERROR RATE DETECTED\n"
+                f"Error Rate: {error_rate*100:.2f}%\n"
+                f"Threshold: {ERROR_THRESHOLD*100:.2f}%\n"
+                f"Errors: {errors}/{total} requests\n"
+                f"Current Pool: {current_pool}"
+            )
+            send_slack_alert(message, last_parsed_data)
+            last_error_alert = current_time
+            print(f"[WARN] High error rate: {error_rate*100:.2f}% (threshold: {ERROR_THRESHOLD*100:.2f}%)")
+        else:
+            remaining = int(ALERT_COOLDOWN - time_since_last)
+            print(f"[WARN] Error rate {error_rate*100:.2f}% ABOVE THRESHOLD (COOLDOWN ACTIVE, {remaining}s remaining)")
+    else:
+        # Reset cooldown when error rate drops below threshold
+        if last_error_alert > 0 and time_since_last > ALERT_COOLDOWN:
+            if errors == 0 and total >= WINDOW_SIZE:
+                print(f"[INFO] Error rate recovered to {error_rate*100:.2f}% (cooldown cleared)")
+
+
+def process_new_lines(file_path):
+    """Read and process new lines from log file"""
+    global file_position
+    
+    try:
+        with open(file_path, 'r') as f:
+            f.seek(file_position)
+            
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                
+                parsed_data = parse_log_line(line)
+                
+                if parsed_data:
+                    # Display parsed fields
+                    print(f"[LOG] pool={parsed_data['pool']} "
+                          f"release={parsed_data['release']} "
+                          f"upstream_status={parsed_data['upstream_status']} "
+                          f"upstream={parsed_data['upstream']}")
+                    
+                    # Check for failover
+                    check_failover(parsed_data)
+                    
+                    # Track 5xx errors in sliding window
+                    is_error = 500 <= parsed_data['upstream_status'] < 600
+                    request_window.append(is_error)
+                    
+                    # Check error rate after each request
+                    check_error_rate()
+            
+            file_position = f.tell()
+    
+    except FileNotFoundError:
+        print(f"[WARN] Log file not found: {file_path}")
+    except Exception as e:
+        print(f"[ERROR] Failed to read log: {e}")
+
+
+class LogHandler(FileSystemEventHandler):
+    """Watchdog event handler for log file changes"""
+    
+    def on_modified(self, event):
+        if LOG_FILE in event.src_path:
+            process_new_lines(LOG_FILE)
+
+
+def main():
+    global is_startup
+    
+    print("=" * 60)
+    print("Nginx Log Watcher - Starting")
+    print("=" * 60)
+    print(f"Log file: {LOG_FILE}")
+    print(f"Window size: {WINDOW_SIZE} requests")
+    print(f"Error threshold: {ERROR_THRESHOLD*100:.2f}%")
+    print(f"Alert cooldown: {ALERT_COOLDOWN}s ({ALERT_COOLDOWN//60} minutes)")
+    print(f"Slack webhook: {'configured' if SLACK_WEBHOOK_URL else 'NOT SET'}")
+    print(f"Current time: {get_current_time()}")
+    print("=" * 60)
     
     # Wait for log file to exist
     while not os.path.exists(LOG_FILE):
-        print(f"[WAITING] Log file not found: {LOG_FILE}")
+        print(f"[INFO] Waiting for log file: {LOG_FILE}")
         time.sleep(2)
     
-    with open(LOG_FILE, 'r') as f:
-        # Go to end of file
-        f.seek(0, 2)
-        
-        while True:
-            line = f.readline()
-            if not line:
-                time.sleep(0.1)
-                continue
-            
-            # Skip health check requests
-            if '/health' in line:
-                continue
-            
-            parsed = parse_log_line(line)
-            
-            if parsed['pool']:
-                check_failover(parsed['pool'])
-            
-            if parsed['upstream_status']:
-                request_window.append(parsed['upstream_status'])
-                check_error_rate()
-
-if __name__ == '__main__':
+    print(f"[INFO] Log file found, processing existing logs...")
+    
+    # Process existing lines first (startup mode - no alerts)
+    is_startup = True
+    process_new_lines(LOG_FILE)
+    
+    print(f"[INFO] Processed {len(request_window)} existing requests")
+    if len(request_window) > 0:
+        errors = sum(request_window)
+        error_rate = errors / len(request_window)
+        print(f"[INFO] Initial error rate: {error_rate*100:.2f}% ({errors}/{len(request_window)})")
+    print(f"[INFO] Current pool: {current_pool}")
+    
+    # Now switch to live monitoring mode (alerts enabled)
+    is_startup = False
+    print("=" * 60)
+    print("[INFO] Startup complete. Now monitoring for NEW events...")
+    print("=" * 60)
+    
+    # Start watching for changes
+    event_handler = LogHandler()
+    observer = Observer()
+    observer.schedule(event_handler, path=os.path.dirname(LOG_FILE), recursive=False)
+    observer.start()
+    
+    print("[INFO] Watching for log changes...")
+    
     try:
-        tail_log_file()
+        while True:
+            time.sleep(1)
     except KeyboardInterrupt:
-        print("\n[SHUTDOWN] Watcher stopped")
-    except Exception as e:
-        print(f"[ERROR] Watcher crashed: {e}")
-        raise
+        print("\n[INFO] Shutting down...")
+        observer.stop()
+    
+    observer.join()
+
+
+if __name__ == "__main__":
+    main()
