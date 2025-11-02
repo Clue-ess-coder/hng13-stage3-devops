@@ -3,13 +3,12 @@ services:
         image: nginx:alpine
         ports:
             - "8080:80"
+        container_name: nginx
         volumes:
             - ./nginx.conf.template:/etc/nginx/templates/default.conf.template:ro
             - nginx_logs:/var/log/nginx
         environment:
             - ACTIVE_POOL=${ACTIVE_POOL}
-        networks:
-            - app_network
         depends_on:
             - app_blue
             - app_green
@@ -19,54 +18,39 @@ services:
         image: ${BLUE_IMAGE}
         ports:
             - "8081:3000"
+        container_name: app_blue
         environment:
             - APP_POOL=blue
             - RELEASE_ID=${RELEASE_ID_BLUE}
             - PORT=3000
-        networks:
-            - app_network
-        healthcheck:
-            test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
-            interval: 5s
-            timeout: 3s
-            retries: 3
 
     app_green:
         image: ${GREEN_IMAGE}
         ports:
             - "8082:3000"
+        container_name: app_green
         environment:
             - APP_POOL=green
             - RELEASE_ID=${RELEASE_ID_GREEN}
             - PORT=3000
-        healthcheck:
-            test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
-            interval: 5s
-            timeout: 3s
-            retries: 3
 
     alert_watcher:
-        image: python:3.11-slim
+        image: python:3.9.25-slim
+        container_name: alert_watcher
         volumes:
             - ./watcher.py:/app/watcher.py:ro
             - ./requirements.txt:/app/requirements.txt:ro
-            - nginx_logs:/var/log/nginx:ro
+            - nginx_logs:/var/log/nginx
         environment:
             - SLACK_WEBHOOK_URL=${SLACK_WEBHOOK_URL}
             - ERROR_RATE_THRESHOLD=${ERROR_RATE_THRESHOLD}
             - WINDOW_SIZE=${WINDOW_SIZE}
             - ALERT_COOLDOWN_SEC=${ALERT_COOLDOWN_SEC}
-            - LOG_FILE=/var/log/nginx/access.log
-        networks:
-            - app_network
+            - LOG_FILE=/var/log/nginx/custom_access.log
         depends_on:
             - nginx
         working_dir: /app
-        command: /bin/sh -c "pip install --no-cache-dir -r requirements.txt && python -u watcher.py"
-
-networks:
-    app_network:
-        driver: bridge
+        command: /bin/sh -c "pip install --no-cache-dir -r requirements.txt --retries 5 --timeout 30 && python -u watcher.py"
 
 volumes:
     nginx_logs:
