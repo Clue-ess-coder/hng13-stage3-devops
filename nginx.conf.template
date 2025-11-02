@@ -21,8 +21,8 @@ upstream backend_green_primary {
 server {
     listen 80;
 
-    access_log /var/log/nginx/access.log detailed;
-    error_log /var/log/nginx/error.log warn;
+    access_log /var/log/nginx/custom_access.log detailed;
+    error_log /var/log/nginx/custom_error.log warn;
     
     location / {
         proxy_pass http://backend_${ACTIVE_POOL}_primary;
@@ -33,11 +33,5 @@ server {
         proxy_next_upstream_tries 2;
         proxy_next_upstream_timeout 10s;
         proxy_pass_request_headers on;
-    }
-    
-    location /health {
-        access_log off;
-        return 200 "nginx healthy\n";
-        add_header Content-Type text/plain;
     }
 }
