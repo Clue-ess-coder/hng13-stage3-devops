@@ -1,274 +1,240 @@
-# Blue/Green Deployment Runbook
+# HNG Stage 3 Blue/Green Deployment Runbook
 
-## Overview
-This runbook provides operational guidance for responding to alerts from the Blue/Green deployment monitoring system.
+## Alert Types and Operator Actions
 
----
+### FAILOVER DETECTED
 
-## Alert Types
+This means traffic has automatically switched from one pool (blue or green) to the other due to induced chaos or upstream errors.
 
-### 🔄 Failover Detected
+Here's what that looks like:
 
-**What it means:**  
-The active pool has automatically switched from one deployment (Blue/Green) to another due to health check failures or upstream errors.
+```md
+FAILOVER DETECTED
+Pool switched: blue → green
+Time: 2025-11-02 07:30:15
 
-**Example Alert:**
+Details:
+- Pool: green
+- Release: v1.0.1
+- Upstream: 172.18.0.3:3000
+- Upstream Status: 500
+- Request Time: 0.012s
+- Upstream Response Time: 0.002s
 ```
-⚠️ Failover Detected: BLUE → GREEN
-Time: 2025-10-30 14:23:15
-Previous pool (blue) is likely unhealthy. Check container status.
+
+#### Operator Actions
+
+1. First, check the failed pool container logs
+
+   ```bash
+   > docker logs app_blue       # or app_green
+   
+   🟢 blue server pool responding to: /chaos/start
+   🧪 Simulation mode set to 'error'
+   🟢 blue server pool responding to: /version
+   💥 Simulated error for: /version
+   🟢 blue server pool responding to: /version
+   💥 Simulated error for: /version
+   ```
+
+2. Then verify backup pool works as expected
+
+   ```bash
+   > curl http://localhost:8080/version  # should redirect traffic to green
+
+   > docker logs app_green               # tail logs to confirm
+
+   🟢 green server pool responding to: /version
+   ```
+
+3. Review Nginx logs to ensure traffic is being routed to backup pool
+
+   ```bash
+   > docker exec nginx tail -5 /var/log/nginx/custom_access.log
+  
+   172.18.0.1 - - [02/Nov/2025:10:09:30 +0000] "GET /version HTTP/1.1" 200 57 "-" "curl/8.5.0" pool=blue release=v1.0.0 upstream_status=200 upstream=172.18.0.2:3000 request_time=0.001 upstream_response_time=0.001
+   172.18.0.1 - - [02/Nov/2025:10:11:41 +0000] "GET /version HTTP/1.1" 200 57 "-" "curl/8.5.0" pool=green release=v1.0.1 upstream_status=500, 200 upstream=172.18.0.2:3000, 172.18.0.3:3000 request_time=0.003 upstream_response_time=0.001, 0.002
+   ```
+
+4. Tail alert_watcher logs for context
+
+   ```bash
+   docker logs -f alert_watcher
+   ```
+
+5. If primary pool needs fixes
+   - Leave traffic on backup pool
+   - Fix/redeploy the failed container
+   - Test directly before switching back
+
+   ```bash
+   curl http://localhost:8081/version        # if chaos on app_blue
+   curl http://localhost:8082/version        # if chaos on app_green
+   ````
+
+#### Alert Cooldown
+
+A failover event triggers an alert with a 300s (5 mins) cooldown.
+
+### HIGH ERROR RATE
+
+This means the percentage of 5xx errors from upstream containers exceeds the set threshold with respect to the maximum number of requests in the sliding window.
+
+**Sample:**
+
+```txt
+HIGH ERROR RATE DETECTED
+Error Rate: 6.50%
+Threshold: 2.00%           # for default 2% threshold
+Errors: 8/123 requests
+Current Pool: green
+Time: 2025-11-02 08:36:52
+
+Details:
+- Pool: green
+- Release: v1.0.1
+- Upstream: 172.18.0.3:3000
+- Upstream Status: 500
+- Request Time: 0.045s
+- Upstream Response Time: 0.043s
 ```
 
 **Operator Actions:**
 
-1. **Check Container Status**
+1. Tail logs in real-time
+
    ```bash
-   docker ps -a
-   docker logs blue
-   docker logs green
+   > docker logs -f alert_watcher
+
+   [INFO] Error rate: 3.03% (5/165) ✗
+   [ALERT] HIGH ERROR RATE DETECTED
+   Error Rate: 3.03%
+   Threshold: 2.00%
+   Errors: 5/165 requests
+   Current Pool: green
+         Time: 2025-11-02 12:27:19
+         Pool: green, Release: v1.0.1
+         Upstream: 172.18.0.2:3000, Status: 500
+   [INFO] Slack alert sent successfully
+   [WARN] High error rate: 3.03% (threshold: 2.00%)
    ```
 
-2. **Verify Health of Failed Pool**
+2. Check Nginx logs for upstream errors
+
    ```bash
-   # Check if container is running
-   docker inspect blue --format='{{.State.Status}}'
+   > docker exec nginx tail -5 /var/log/nginx/custom_access.log
    
-   # Check health endpoint directly
-   curl http://localhost:8000/health
+   172.18.0.1 - - [02/Nov/2025:11:27:19 +0000] "GET /version HTTP/1.1" 200 57 "-" "curl/8.5.0" pool=green release=v1.0.1 upstream_status=500, 200 upstream=172.18.0.2:3000, 172.18.0.3:3000 request_time=0.003 upstream_response_time=0.002, 0.002
    ```
 
-3. **Investigate Root Cause**
-   - Review application logs for errors
-   - Check resource utilization (CPU, memory)
-   - Verify network connectivity
-   - Look for recent deployments or changes
+3. Perform a manual pool toggle
 
-4. **Recovery Steps**
-   - If the failed pool is healthy, toggle back:
+   ```bash
+   # set ACTIVE_POOL=green
+
+   # restart nginx
+   docker compose restart nginx
+   ```
+
+4. Clear the error rate by sending 200+ successful requests to push errors out of the window
+
      ```bash
-     # Update .env
-     ACTIVE_POOL=blue
-     
-     # Restart nginx to pick up change
-     docker compose restart nginx
+     for i in {1..200}; do curl http://localhost:8080/version > /dev/null; sleep 0.1; done
      ```
-   - If unhealthy, leave on green and fix blue offline
 
-5. **Post-Incident**
-   - Document the incident
-   - Update monitoring if needed
-   - Review deployment process
+>Old errors don't disappear immediately. They stay in the window until pushed out by 200+ new requests.
 
----
+After sending an alert, high error rate alerts won't be sent for another 300s (5 minutes).
 
-### 🔥 High Error Rate Detected
+### RECOVERY
 
-**What it means:**  
-The upstream application is returning HTTP 5xx errors above the configured threshold (default: 2% over last 200 requests).
-
-**Example Alert:**
-```
-🔥 High Error Rate Detected: 5.23%
-Threshold: 2.0%
-Window: 200 requests
-5xx errors: 10
-Time: 2025-10-30 14:25:42
-Action: Check upstream application logs and consider toggling pools.
-```
-
-**Operator Actions:**
-
-1. **Immediate Assessment**
    ```bash
-   # Check which pool is active
-   docker compose exec nginx cat /etc/nginx/conf.d/default.conf | grep proxy_pass
-   
-   # View recent errors in Nginx logs
-   docker compose exec nginx tail -n 50 /var/log/nginx/access.log | grep " 5"
+   # stop chaos
+   curl -X POST http://localhost:8081/chaos/stop
+   # This will trigger another failover alert
+
+   curl http://localhost:8080/version
+   # returns primary pool in nginx logs
    ```
 
-2. **Check Application Health**
-   ```bash
-   # View application logs
-   docker logs blue --tail=100
-   docker logs green --tail=100
-   
-   # Check health endpoints
-   curl http://localhost/health
-   ```
+## Maintenance Mode (Suppressing Alerts)
 
-3. **Determine Scope**
-   - Is this affecting all requests or specific endpoints?
-   - Is it transient or sustained?
-   - Check external dependencies (databases, APIs)
+During planned toggles, operators can use one of these methods to suppress alerts:
 
-4. **Mitigation Options**
-   
-   **Option A: Toggle to alternate pool**
-   ```bash
-   # If blue is active and erroring, switch to green
-   # Update .env
-   ACTIVE_POOL=green
-   
-   # Restart nginx
-   docker compose restart nginx
-   ```
-   
-   **Option B: Restart failing container**
-   ```bash
-   docker compose restart blue
-   ```
-   
-   **Option C: Scale down traffic**
-   - Implement rate limiting
-   - Enable maintenance mode
+### Option 1 - Stop Watcher
 
-5. **Monitor Recovery**
-   ```bash
-   # Watch logs in real-time
-   docker compose logs -f alert_watcher
-   
-   # Check error rate manually
-   docker compose exec nginx tail -f /var/log/nginx/access.log
-   ```
-
----
-
-## Maintenance Mode
-
-### Suppressing Alerts During Planned Changes
-
-When performing planned pool toggles or maintenance, you may want to temporarily disable alerts:
-
-**Option 1: Stop the watcher**
 ```bash
+# before maintenance
 docker compose stop alert_watcher
-# Perform maintenance
-docker compose start alert_watcher
-```
 
-**Option 2: Set a maintenance flag (future enhancement)**
-```bash
-# Add to .env
-MAINTENANCE_MODE=true
+# perform changes...
 
-# This will suppress failover alerts but keep error-rate monitoring
-```
-
----
-
-## Common Scenarios
-
-### Scenario 1: Planned Blue → Green Deployment
-
-1. Verify green is healthy
-2. Stop alert_watcher to avoid false alerts
-3. Update `.env`: `ACTIVE_POOL=green`
-4. Restart nginx: `docker compose restart nginx`
-5. Monitor for 5 minutes
-6. Restart alert_watcher: `docker compose start alert_watcher`
-
-### Scenario 2: Emergency Rollback
-
-1. If green is failing, quickly revert to blue:
-   ```bash
-   # Update .env
-   ACTIVE_POOL=blue
-   docker compose restart nginx
-   ```
-2. Monitor alert_watcher logs for recovery confirmation
-
-### Scenario 3: Both Pools Unhealthy
-
-1. Check if issue is upstream (database, external API)
-2. Review recent changes across all infrastructure
-3. Consider emergency maintenance page
-4. Restart all services:
-   ```bash
-   docker compose restart
-   ```
-
----
-
-## Alert Configuration
-
-Adjust alert sensitivity in `.env`:
-
-```bash
-# Increase threshold if too sensitive
-ERROR_RATE_THRESHOLD=5.0
-
-# Increase window for more stable detection
-WINDOW_SIZE=500
-
-# Reduce alert frequency
-ALERT_COOLDOWN_SEC=600
-```
-
-After changing values:
-```bash
+# after maintenance
 docker compose restart alert_watcher
 ```
 
----
+### Option 2 - Disable Slack Webhook
 
-## Viewing Logs
-
-**Nginx Access Logs (structured):**
-```bash
-docker compose exec nginx tail -f /var/log/nginx/access.log
-```
-
-**Alert Watcher Logs:**
-```bash
-docker compose logs -f alert_watcher
-```
-
-**All Services:**
-```bash
-docker compose logs -f
-```
-
----
-
-## Escalation Path
-
-1. **Level 1:** Check runbook, attempt standard remediation
-2. **Level 2:** Contact on-call DevOps engineer
-3. **Level 3:** Escalate to platform team lead
-4. **Level 4:** Initiate major incident protocol
-
----
-
-## Health Check Commands
+When testing changes with active monitoring
 
 ```bash
-# Quick health check
-curl http://localhost/health
+# comment out webhook URL
+# SLACK_WEBHOOK_URL=https://hooks.slack.com/services/custom-hook
 
-# Detailed status
-docker compose ps
-docker stats --no-stream
 
-# End-to-end test
-curl -i http://localhost/
+# restart alert_watcher
+docker compose restart alert_watcher
 
-# Check which pool is serving
-curl -i http://localhost/ | grep -i "x-app-pool"
+# tail logs
+docker logs -f alert_watcher 
+
+# uncomment webhook and restart alert_watcher after maintenance
 ```
 
----
+### Option 3 - Increase Cooldown
 
-## Contact Information
+For very short maintenance sessions
 
-- **Slack Channel:** #devops-alerts
-- **On-Call:** [PagerDuty/Opsgenie rotation]
-- **Documentation:** https://github.com/your-org/blue-green-deploy
+```bash
+# edit cooldown in .env:
+ALERT_COOLDOWN_SEC=3600
 
----
+# restart watcher
+docker compose restart alert_watcher
 
-## Revision History
+# ...........
+# maintenance
+# ...........
 
-| Date       | Version | Changes         |
-| ---------- | ------- | --------------- |
-| 2025-10-30 | 1.0     | Initial runbook |
+# reset cooldown to required
+ALERT_COOLDOWN_SEC=300
+
+## restart alert_watcher
+docker compose restart alert_watcher
+```
+
+The first failover or high error rate event after restart will trigger an alert still. This is because the cooldown starts ONLY after an alert.
+
+### Recommended Workflow
+
+```bash
+# stop watcher
+docker compose stop alert_watcher
+
+# Change active pool in .env
+
+# restart nginx
+docker compose restart nginx
+
+# verify new pool receives traffic
+curl http://localhost:8080/version        # Should show pool=green in nginx logs
+
+# generate traffic to clear any error windows
+for i in {1..200}; do curl -s http://localhost:8080/version > /dev/null; done
+
+# restart alert_watcher
+docker compose restart alert_watcher
+
+# tail logs for issues
+docker logs -f alert_watcher
+```
